@@ -1,51 +1,37 @@
-#  Toxicogenomics RNA-Seq Pipeline: Drug-Induced Liver Injury (DILI)
-**Advanced Bioinformatics Workflow for Differential Gene Expression and Pathway Enrichment**
+#  AI-Integrated Toxicogenomics & Multi-Omics Engine 
+**Deep Learning (Keras/TensorFlow), WGCNA, and XGBoost for Predictive Toxicology**
 
 ##  Project Overview
-This repository contains an enterprise-grade computational biology pipeline designed to process and analyze high-dimensional transcriptomic data. Specifically, it models **Drug-Induced Liver Injury (DILI)** by evaluating the molecular response of human hepatocytes exposed to a known hepatotoxin (e.g., Acetaminophen/APAP).
+This repository contains a high-dimensional, enterprise-grade programmatic architecture designed to model **Drug-Induced Liver Injury (DILI)**. Going far beyond traditional differential expression, this pipeline integrates Artificial Intelligence (AI) and Systems Biology to predict hepatotoxicity severity directly from raw RNA-seq transcriptomic signatures.
 
-Bridging clinical pharmacotherapy with molecular biology, this pipeline transforms raw RNA sequencing counts into actionable toxicological insights, identifying transcriptomic biomarkers of cellular stress, apoptosis, and metabolic dysfunction.
-
----
-
-## Computational & Molecular Workflow
-
-### 1. High-Dimensional Transcriptomic Simulation
-To demonstrate robust data wrangling capabilities, the pipeline simulates a massive RNA-seq count matrix containing **20,000 genes across 12 biological replicates** (6 Controls vs. 6 Exposed). The baseline read counts are modeled using a negative binomial distribution, with true biological signals injected to simulate transcriptomic alterations (upregulation of oxidative stress and downregulation of basal metabolic pathways).
-
-### 2. Differential Gene Expression (DESeq2)
-The core statistical engine utilizes the Bioconductor package `DESeq2`. 
-* **Pre-filtering:** Removes low-count genes to optimize memory and statistical power.
-* **Dispersion Estimation & Modeling:** Fits a generalized linear model (GLM) using negative binomial distribution assumptions.
-* **FDR Control & Log-Fold Shrinkage:** Applies the Benjamini-Hochberg procedure for strict False Discovery Rate (FDR < 0.05) control, and utilizes `apeglm` to shrink extreme Log2 Fold Changes (LFC) associated with low-expression genes, reducing false positives.
-
-### 3. Dimensionality Reduction & Quality Control
-Before executing statistical tests, the pipeline verifies data integrity and batch effects:
-* Applies **Variance Stabilizing Transformation (VST)** to homoskedasticize the count data.
-* Executes **Principal Component Analysis (PCA)** to visualize sample clustering, ensuring separation is driven by hepatotoxin exposure rather than technical artifacts.
-
-### 4. Functional Pathway Enrichment Analysis
-Identifying a list of differentially expressed genes (DEGs) is only the first step. The pipeline utilizes `clusterProfiler` to translate gene lists into biological meaning:
-* **Over-Representation Analysis (ORA):** Maps significantly perturbed genes to the **Gene Ontology (GO)** database.
-* **Mechanism Identification:** Programmatically identifies whether the hepatotoxin triggers specific biological processes (BP) such as cytochrome P450 (CYP) induction, reactive oxygen species (ROS) metabolism, or caspase-mediated apoptosis.
+By bridging deep biological knowledge (Pharm.D.) with advanced machine learning, this pipeline demonstrates PhD-level capabilities in systems toxicology, biomarker discovery, and computational biology.
 
 ---
 
-##  Translational Relevance
-This project directly reflects the methodologies utilized in modern translational toxicology. By moving beyond traditional serum biomarkers (like ALT/AST) and evaluating toxicity at the transcriptomic level, researchers can identify the exact molecular mechanisms of adverse drug reactions long before macroscopic cellular necrosis occurs. This computational approach is foundational for predictive toxicology and the development of safer pharmaceutical compounds.
+##  Advanced Computational Architecture
+
+### 1. Batch Correction & Likelihood Ratio Testing (DESeq2 / ComBat-seq)
+Raw sequencing data is intrinsically noisy. This pipeline utilizes `ComBat-seq` for robust removal of batch effects (adjusting for multi-center laboratory variance). Differential expression is modeled via `DESeq2` utilizing a **Likelihood Ratio Test (LRT)** to capture complex, dose-response transcriptomic perturbations across Vehicle, Low-Dose, and High-Dose exposure groups.
+
+### 2. Weighted Gene Co-expression Network Analysis (WGCNA)
+To move from individual genes to biological systems, the pipeline constructs a scale-free topological network. By computing a Topological Overlap Matrix (TOM), it clusters 20,000 genes into functional modules (e.g., Oxidative Stress, Apoptosis). The Module Eigengenes (MEs) are extracted to represent entire molecular pathways mathematically.
+
+### 3. Deep Learning Autoencoder (Keras / TensorFlow)
+High-dimensional omics data (20,000+ features) suffers from the "curse of dimensionality" when fed into predictive models. This script builds a Deep Neural Network Autoencoder to compress the transcriptomic data into a dense, 32-dimensional **Latent Space**. This performs non-linear feature extraction, capturing the underlying biological geometry of hepatotoxicity.
+
+### 4. Predictive Machine Learning (XGBoost)
+The pipeline merges the Systems Biology metrics (WGCNA Eigengenes) and the AI metrics (Deep Learning Latent Features) into a unified dataset. An **Extreme Gradient Boosting (XGBoost)** regression model is trained to predict the exact quantitative severity of liver injury. The model utilizes cross-validation, hyperparameter tuning, and early stopping, outputting feature importance metrics to identify the strongest predictors of necrosis.
 
 ---
 
-## Technical Stack
+##  Technical Stack
 * **Language:** R (Version 4.2+)
-* **Core Bioinformatics:** `Bioconductor`
-* **Differential Expression:** `DESeq2`
-* **Data Visualization:** `EnhancedVolcano`, `pheatmap`, `ggplot2`
-* **Gene Set Enrichment:** `clusterProfiler`, `org.Hs.eg.db`
-* **Data Wrangling:** `tidyverse`
+* **Deep Learning:** `keras`, `tensorflow`
+* **Machine Learning:** `xgboost`, `caret`
+* **Systems Biology:** `WGCNA`, `DESeq2`, `sva`, `GSVA`
+* **Infrastructure:** `doParallel` (Multi-core tensor processing)
 
 ##  Execution
-To run the full simulation and analysis pipeline locally:
+To run this multi-omics AI pipeline:
 ```R
-# Ensure BiocManager is installed, then run:
-source("dili_transcriptomics_pipeline.R")
+source("ai_toxicogenomics_master_pipeline.R")
