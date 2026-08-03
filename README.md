@@ -1,37 +1,65 @@
-#  AI-Integrated Toxicogenomics & Multi-Omics Engine 
-**Deep Learning (Keras/TensorFlow), WGCNA, and XGBoost for Predictive Toxicology**
+# AI-Integrated Toxicogenomics & Multi-Omics Predictive Engine
 
-##  Project Overview
-This repository contains a high-dimensional, enterprise-grade programmatic architecture designed to model **Drug-Induced Liver Injury (DILI)**. Going far beyond traditional differential expression, this pipeline integrates Artificial Intelligence (AI) and Systems Biology to predict hepatotoxicity severity directly from raw RNA-seq transcriptomic signatures.
+**Nested-CV XGBoost + Bayesian tuning, a trained Keras autoencoder, WGCNA network biology, and GSVA pathway enrichment for quantitative Drug-Induced Liver Injury (DILI) risk modeling from RNA-seq.**
 
-By bridging deep biological knowledge (Pharm.D.) with advanced machine learning, this pipeline demonstrates PhD-level capabilities in systems toxicology, biomarker discovery, and computational biology.
+## Overview
 
----
+This repository models Drug-Induced Liver Injury (DILI) severity directly from transcriptomic signatures by combining three complementary feature representations — mechanistic (WGCNA co-expression modules), curated biological (GSVA pathway enrichment), and learned (autoencoder latent space) — into a single predictive layer.
 
-##  Advanced Computational Architecture
+The pipeline is organized as independently testable functions rather than a linear script, so each stage (simulation, batch correction, differential expression, network construction, representation learning, predictive modeling, interpretation) can be run, validated, and reasoned about on its own.
 
-### 1. Batch Correction & Likelihood Ratio Testing (DESeq2 / ComBat-seq)
-Raw sequencing data is intrinsically noisy. This pipeline utilizes `ComBat-seq` for robust removal of batch effects (adjusting for multi-center laboratory variance). Differential expression is modeled via `DESeq2` utilizing a **Likelihood Ratio Test (LRT)** to capture complex, dose-response transcriptomic perturbations across Vehicle, Low-Dose, and High-Dose exposure groups.
+## Pipeline Architecture
 
-### 2. Weighted Gene Co-expression Network Analysis (WGCNA)
-To move from individual genes to biological systems, the pipeline constructs a scale-free topological network. By computing a Topological Overlap Matrix (TOM), it clusters 20,000 genes into functional modules (e.g., Oxidative Stress, Apoptosis). The Module Eigengenes (MEs) are extracted to represent entire molecular pathways mathematically.
+| Stage | Method | Purpose |
+|---|---|---|
+| 1. Simulation | Parameterized NB count generator | Synthetic dose-response cohort (Vehicle / Low / High dose) with injected mechanistic gene modules |
+| 2. Batch correction | `ComBat-seq` | Removes multi-lab technical variance; validated with a PCA-based pre/post QC check, not assumed |
+| 3. Differential expression | `DESeq2`, LRT (full vs. reduced model), `apeglm` shrinkage | Identifies dose-responsive genes; independent filtering applied |
+| 4. Network biology | `WGCNA`, signed TOM, automatic soft-thresholding | Reduces 5,000 variable genes to co-expression modules; module-trait correlation and intramodular-connectivity hub gene identification |
+| 5. Pathway enrichment | `GSVA` (Gaussian kernel) | Single-sample enrichment scores over a curated hepatotoxicity gene-set panel, used as model features |
+| 6. Representation learning | Keras/TensorFlow autoencoder (512→128→32→128→512) | Real `fit()`/`predict()` calls with early stopping, LR reduction on plateau, and checkpointing — not a placeholder |
+| 7. Predictive modeling | `XGBoost`, 5-fold inner CV, Bayesian hyperparameter optimization (`ParBayesianOptimization`) | Tunes `eta`, `max_depth`, `subsample`, `colsample_bytree`, `min_child_weight` against CV RMSE rather than a fixed grid |
+| 8. Interpretation | SHAP (`SHAPforxgboost`) | Per-sample, game-theoretic feature attribution in place of raw gain/cover importance |
+| 9. Diagnostics | Bootstrap CI (2,000 resamples) | 95% CI on test RMSE/R², residual normality (Shapiro-Wilk), residual mean/SD |
+| 10. Persistence | `xgb.save`, `saveRDS`, TF SavedModel | Serializes trained model, WGCNA/SHAP objects, and a resolved-config + session-info provenance snapshot for reproducibility |
 
-### 3. Deep Learning Autoencoder (Keras / TensorFlow)
-High-dimensional omics data (20,000+ features) suffers from the "curse of dimensionality" when fed into predictive models. This script builds a Deep Neural Network Autoencoder to compress the transcriptomic data into a dense, 32-dimensional **Latent Space**. This performs non-linear feature extraction, capturing the underlying biological geometry of hepatotoxicity.
+## What Changed From the Original Version
 
-### 4. Predictive Machine Learning (XGBoost)
-The pipeline merges the Systems Biology metrics (WGCNA Eigengenes) and the AI metrics (Deep Learning Latent Features) into a unified dataset. An **Extreme Gradient Boosting (XGBoost)** regression model is trained to predict the exact quantitative severity of liver injury. The model utilizes cross-validation, hyperparameter tuning, and early stopping, outputting feature importance metrics to identify the strongest predictors of necrosis.
+The earlier version of this pipeline demonstrated the right technology list (DESeq2, WGCNA, Keras, XGBoost) but had a load-bearing gap: the autoencoder's `fit()`/`predict()` calls were commented out, and the "latent features" fed into the predictive model were `matrix(rnorm(...))` — random noise standing in for a trained representation. This version fixes that directly: the autoencoder is actually trained, with real callbacks and a real bottleneck extraction.
 
----
+Beyond that fix, this version adds the layers that separate a demo script from a defensible modeling pipeline:
 
-##  Technical Stack
-* **Language:** R (Version 4.2+)
-* **Deep Learning:** `keras`, `tensorflow`
-* **Machine Learning:** `xgboost`, `caret`
-* **Systems Biology:** `WGCNA`, `DESeq2`, `sva`, `GSVA`
-* **Infrastructure:** `doParallel` (Multi-core tensor processing)
+- **Nested validation** instead of a single train/test split with fixed hyperparameters — hyperparameters are chosen by inner 5-fold CV, not read off a hardcoded list.
+- **Interpretability** via SHAP rather than raw split-gain importance, which is sensitive to feature scale and correlation structure.
+- **Uncertainty quantification** — bootstrap confidence intervals on RMSE/R², not a single point estimate.
+- **QC as code** — the PCA-based batch-effect check is computed and logged, not assumed to have worked because `ComBat_seq()` was called.
+- **Modularity and unit tests** — the simulation and preprocessing layer has `testthat` coverage, so correctness claims are checked, not asserted.
+- **Reproducibility artifacts** — every run writes a resolved config, session info, and a timestamped log.
 
-##  Execution
-To run this multi-omics AI pipeline:
-```R
-source("ai_toxicogenomics_master_pipeline.R")
+## Technical Stack
+
+- **Language:** R (≥ 4.2)
+- **Differential expression / network biology:** `DESeq2`, `sva`, `WGCNA`, `GSVA`, `GSEABase`
+- **Deep learning:** `keras`, `tensorflow`
+- **Predictive modeling:** `xgboost`, `caret`, `ParBayesianOptimization`
+- **Interpretation:** `SHAPforxgboost`
+- **Engineering:** `optparse` (CLI), `futile.logger` (structured logging), `doParallel`, `testthat`, `yaml`
+
+## Usage
+
+```bash
+# Default run (500 samples, 20,000 genes, seed 2026)
+Rscript ai_toxicogenomics_master_pipeline.R
+
+# Custom run with a YAML config override
+Rscript ai_toxicogenomics_master_pipeline.R --config_file config.yaml
+
+# Direct CLI overrides
+Rscript ai_toxicogenomics_master_pipeline.R --n_samples 800 --bo_iterations 25 --output_dir results/
+```
+
+Sourcing the file interactively (`source("ai_toxicogenomics_master_pipeline.R")`) does **not** auto-execute the pipeline — each stage is a standalone function (`simulate_multiomics_cohort()`, `run_deseq2_lrt()`, `run_wgcna_analysis()`, etc.), so individual stages can be run, inspected, or unit-tested in isolation. Full execution requires calling `run_pipeline(opts)` explicitly or invoking the script via `Rscript`.
+
+## Notes on the Synthetic Data
+
+The RNA-seq cohort and gene-set panel in this repository are simulated (negative-binomial counts with injected dose-dependent modules) so the full pipeline is runnable end-to-end without a data-access agreement. The gene-set panel used for GSVA is illustrative; production use should substitute a curated panel (e.g., MSigDB Hallmark via `msigdbr`) matched to the exposure/tissue context.
