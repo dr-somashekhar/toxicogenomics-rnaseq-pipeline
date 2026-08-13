@@ -1,0 +1,28 @@
+#  Data Dictionary & Multi-Omics Codebook
+
+This document describes the high-dimensional variables, simulated transcriptomic signatures, and machine learning features utilized within the Toxicogenomics & AI pipeline.
+
+## 1. Experimental Metadata & Phenotype
+| Variable Name | Data Type | Description | Unit / Coding |
+| :--- | :--- | :--- | :--- |
+| `Sample_ID` | String | Unique identifier for the simulated hepatocyte culture | `Hepatocyte_1` to `N` |
+| `Batch` | Categorical | Technical sequencing batch (used for ComBat-seq correction) | `Lab_A`, `Lab_B`, `Lab_C` |
+| `Treatment_Group`| Categorical | Experimental hepatotoxin (APAP) exposure level | `Vehicle`, `Low_Dose`, `High_Dose` |
+
+## 2. Transcriptomic Features (RNA-Seq)
+| Variable Name | Data Type | Description | Unit / Coding |
+| :--- | :--- | :--- | :--- |
+| `ENSG000...` | Numeric | Ensembl Gene ID. Contains negative binomial read counts | Raw Integer Counts |
+| `ME1` to `ME_N` | Numeric | WGCNA Module Eigengenes (First principal component of co-expressed gene clusters) | Continuous |
+
+## 3. Artificial Intelligence / Deep Learning Features
+| Variable Name | Data Type | Description | Unit / Coding |
+| :--- | :--- | :--- | :--- |
+| `DL_Latent_Dim_X`| Numeric | Compressed 32-dimensional latent space features extracted via Keras Autoencoder | Scaled Continuous |
+
+## 4. Toxicological Ground Truth (Target Variable)
+| Variable Name | Data Type | Description | Unit / Coding |
+| :--- | :--- | :--- | :--- |
+| `Toxicity_Score` | Numeric | Quantitative algorithm score representing severity of hepatic necrosis and injury | Scale `0` - `100` |
+
+*Note: All datasets are synthetically generated for pipeline validation and computational demonstration.*
