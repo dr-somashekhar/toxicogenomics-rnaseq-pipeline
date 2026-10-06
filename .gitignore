@@ -1,0 +1,8 @@
+pipeline_artifacts/
+results*/
+*.log
+.Rhistory
+.RData
+.Rproj.user/
+.Rapp.history
+.DS_Store

@@ -1,0 +1,9 @@
+# Example override file:  Rscript ai_toxicogenomics_master_pipeline.R --config_file config.example.yaml
+# Any key from the CLI options can be set here; YAML values win over command-line values.
+n_samples: 120        # small, fast demo run (the default is 500)
+n_genes: 5000         # the pipeline needs >= 2000
+seed: 2026
+latent_dim: 16
+bo_iterations: 5
+output_dir: results_demo
+run_tests: true

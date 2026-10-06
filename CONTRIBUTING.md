@@ -11,7 +11,7 @@ We welcome contributions that improve the computational efficiency, statistical 
 ##  Pull Request (PR) Process
 1. **Fork** the repository and create your feature branch (`git checkout -b feature/Advanced-Imputation`).
 2. **Commit** your changes with descriptive messages (`git commit -m 'Added Random Forest imputation method'`).
-3. **Test** your code. Ensure any added statistical models converge properly and do not introduce data leakage.
+3. **Test** your code (`Rscript ai_toxicogenomics_master_pipeline.R --run_tests TRUE --config_file config.example.yaml` runs the unit tests and a small end-to-end run). Ensure any added statistical models converge properly and do not introduce data leakage.
 4. **Push** to the branch (`git push origin feature/Advanced-Imputation`).
 5. **Open a Pull Request** against the `main` branch. 
 

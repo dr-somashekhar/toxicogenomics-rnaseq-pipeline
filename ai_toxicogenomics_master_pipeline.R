@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # ==================================================================================================
 #  AI-INTEGRATED TOXICOGENOMICS & MULTI-OMICS PREDICTIVE MODELING ENGINE
-#  Version: 4.0.0  |  DILI (Drug-Induced Liver Injury) Transcriptomic Risk Modeling
+#  Version: 4.1.0  |  DILI (Drug-Induced Liver Injury) Transcriptomic Risk Modeling
 # ==================================================================================================
 #
 #  ARCHITECTURE
@@ -28,6 +28,8 @@
 #  - The autoencoder is ACTUALLY trained here (no commented-out placeholder branch). If keras/
 #    tensorflow are unavailable in the runtime environment, `build_and_train_autoencoder()`
 #    fails loudly rather than silently substituting random noise for a "latent space."
+#  - Model selection never touches the held-out test set: hyperparameters AND the number of boosting
+#    rounds are chosen by inner CV on the training split only.
 #  - Logging replaces ad hoc `cat()` calls so the pipeline produces an audit trail suitable for
 #    a lab notebook or CI log.
 # ==================================================================================================
@@ -54,7 +56,12 @@ suppressPackageStartupMessages({
   library(doParallel)
   library(testthat)
   library(yaml)
+  library(BiocParallel)
 })
+
+# Be explicit about masked generics (AnnotationDbi / WGCNA mask dplyr::select and stats::cor).
+select <- dplyr::select
+cor    <- stats::cor
 
 # ---- 1.1 CLI ARGUMENTS -----------------------------------------------------------------------
 # Allows `Rscript ai_toxicogenomics_master_pipeline.R --n_samples 500 --seed 2026 --run_tests TRUE`
@@ -84,8 +91,21 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
   if (!is.na(opts$config_file) && file.exists(opts$config_file)) {
     yaml_overrides <- yaml::read_yaml(opts$config_file)
     opts <- modifyList(opts, yaml_overrides)
+  } else if (!is.na(opts$config_file)) {
+    stop("config_file not found: ", opts$config_file)
   }
+  validate_opts(opts)
   opts
+}
+
+validate_opts <- function(opts) {
+  stopifnot(
+    "n_samples must be >= 30 (needed for CV, WGCNA and the autoencoder)" = opts$n_samples >= 30,
+    "n_genes must be >= 2000 (vst() and WGCNA need >1000 genes after filtering)" = opts$n_genes >= 2000,
+    "latent_dim must be >= 2" = opts$latent_dim >= 2,
+    "bo_iterations must be >= 1" = opts$bo_iterations >= 1
+  )
+  invisible(opts)
 }
 
 # ---- 1.2 LOGGING -----------------------------------------------------------------------------
@@ -100,11 +120,22 @@ init_logger <- function(output_dir) {
 
 # ---- 1.3 PARALLEL BACKEND ---------------------------------------------------------------------
 init_parallel_backend <- function() {
-  num_cores <- max(1, parallel::detectCores() - 1)
+  detected <- parallel::detectCores()
+  if (is.na(detected)) detected <- 2
+  num_cores <- max(1, detected - 1)
   registerDoParallel(cores = num_cores)
   allowWGCNAThreads(nThreads = num_cores)
+  # BiocParallel (used by DESeq2 and GSVA): fork on Linux/macOS, sockets on Windows.
+  bp <- make_bpparam(num_cores)
+  BiocParallel::register(bp, default = TRUE)
   flog.info("Parallel backend registered across %d cores.", num_cores)
   num_cores
+}
+
+make_bpparam <- function(num_cores) {
+  if (num_cores <= 1) return(BiocParallel::SerialParam())
+  if (.Platform$OS.type == "windows") BiocParallel::SnowParam(workers = num_cores)
+  else BiocParallel::MulticoreParam(workers = num_cores)
 }
 
 # ---- 1.4 REPRODUCIBILITY SNAPSHOT ---------------------------------------------------------------
@@ -120,27 +151,39 @@ capture_provenance <- function(output_dir, config) {
 }
 
 
+
 # --------------------------------------------------------------------------------------------------
 # 02. SYNTHETIC MULTI-OMICS COHORT SIMULATION
 # --------------------------------------------------------------------------------------------------
+BATCH_LEVELS     <- c("Lab_A", "Lab_B", "Lab_C")
+TREATMENT_LEVELS <- c("Vehicle", "Low_Dose", "High_Dose")
+
 #' Simulate a dose-response hepatotoxicity RNA-seq cohort
 #'
+#' Counts are drawn from a negative binomial whose mean is the product of a per-gene baseline,
+#' a dose-dependent module effect, and a per-batch (lab) gene-wise multiplicative factor, so the
+#' batch-correction stage has a real technical effect to remove.
+#'
 #' @param n_samples number of simulated samples
-#' @param n_genes number of simulated genes
+#' @param n_genes number of simulated genes (module sizes scale with it)
 #' @param seed RNG seed
-#' @return list(counts = matrix, pheno = data.frame, ground_truth_modules = list)
-simulate_multiomics_cohort <- function(n_samples = 500, n_genes = 20000, seed = 2026) {
+#' @param batch_effect_sd SD of the log-normal gene-wise batch factor (0 disables batch effects)
+#' @return list(counts = integer matrix [genes x samples], pheno = data.frame,
+#'              ground_truth_modules = list of gene row indices)
+simulate_multiomics_cohort <- function(n_samples = 500, n_genes = 20000, seed = 2026,
+                                       batch_effect_sd = 0.5) {
   set.seed(seed)
   flog.info("Simulating cohort: n_samples=%d, n_genes=%d", n_samples, n_genes)
 
   pheno_data <- data.frame(
     Sample_ID = paste0("Hepatocyte_", seq_len(n_samples)),
-    Batch = factor(sample(c("Lab_A", "Lab_B", "Lab_C"), n_samples, replace = TRUE)),
+    Batch = factor(sample(BATCH_LEVELS, n_samples, replace = TRUE), levels = BATCH_LEVELS),
     Treatment_Group = factor(
-      sample(c("Vehicle", "Low_Dose", "High_Dose"), n_samples, replace = TRUE, prob = c(0.4, 0.3, 0.3)),
-      levels = c("Vehicle", "Low_Dose", "High_Dose")
+      sample(TREATMENT_LEVELS, n_samples, replace = TRUE, prob = c(0.4, 0.3, 0.3)),
+      levels = TREATMENT_LEVELS
     )
   )
+  rownames(pheno_data) <- pheno_data$Sample_ID
 
   pheno_data$Toxicity_Score <- with(pheno_data, {
     base <- ifelse(Treatment_Group == "Vehicle", rnorm(n_samples, 10, 5),
@@ -149,29 +192,41 @@ simulate_multiomics_cohort <- function(n_samples = 500, n_genes = 20000, seed = 
     pmin(pmax(base, 0), 100)
   })
 
-  base_means <- rnbinom(n_genes, mu = 800, size = 1.2)
-  raw_counts <- matrix(rnbinom(n_genes * n_samples, mu = base_means, size = 1.2), ncol = n_samples)
-  rownames(raw_counts) <- paste0("ENSG", sprintf("%06d", seq_len(n_genes)))
-  colnames(raw_counts) <- pheno_data$Sample_ID
+  # Per-gene baseline mean, expanded to a genes x samples matrix of NB means.
+  base_means <- pmax(rnbinom(n_genes, mu = 800, size = 1.2), 1)
+  mu <- matrix(base_means, nrow = n_genes, ncol = n_samples)
 
-  # Ground-truth mechanistic gene modules injected into the synthetic signal.
-  mod_ox_stress  <- sample(seq_len(n_genes), 400)
-  mod_apoptosis  <- sample(setdiff(seq_len(n_genes), mod_ox_stress), 400)
-  mod_necrosis   <- sample(setdiff(seq_len(n_genes), c(mod_ox_stress, mod_apoptosis)), 300)
+  # Ground-truth mechanistic gene modules (non-overlapping), sized as a fraction of n_genes.
+  module_sizes <- pmax(1L, floor(n_genes * c(0.02, 0.02, 0.015)))
+  mod_ox_stress <- sample(seq_len(n_genes), module_sizes[1])
+  mod_apoptosis <- sample(setdiff(seq_len(n_genes), mod_ox_stress), module_sizes[2])
+  mod_necrosis  <- sample(setdiff(seq_len(n_genes), c(mod_ox_stress, mod_apoptosis)), module_sizes[3])
 
+  scale_module <- function(mu, genes, samples, lo, hi) {
+    if (length(samples) == 0) return(mu)
+    mu[genes, samples] <- mu[genes, samples] *
+      matrix(runif(length(genes) * length(samples), lo, hi), nrow = length(genes))
+    mu
+  }
   high_idx <- which(pheno_data$Treatment_Group == "High_Dose")
   low_idx  <- which(pheno_data$Treatment_Group == "Low_Dose")
+  mu <- scale_module(mu, mod_ox_stress, high_idx, 3, 10)
+  mu <- scale_module(mu, mod_apoptosis, high_idx, 0.1, 0.5)
+  mu <- scale_module(mu, mod_necrosis,  high_idx, 4, 12)
+  mu <- scale_module(mu, mod_ox_stress, low_idx,  1.5, 3)
 
-  raw_counts[mod_ox_stress, high_idx] <- raw_counts[mod_ox_stress, high_idx] *
-    matrix(runif(400 * length(high_idx), 3, 10), ncol = length(high_idx))
-  raw_counts[mod_apoptosis, high_idx] <- raw_counts[mod_apoptosis, high_idx] *
-    matrix(runif(400 * length(high_idx), 0.1, 0.5), ncol = length(high_idx))
-  raw_counts[mod_necrosis, high_idx] <- raw_counts[mod_necrosis, high_idx] *
-    matrix(runif(300 * length(high_idx), 4, 12), ncol = length(high_idx))
-  raw_counts[mod_ox_stress, low_idx] <- raw_counts[mod_ox_stress, low_idx] *
-    matrix(runif(400 * length(low_idx), 1.5, 3), ncol = length(low_idx))
+  # Technical batch effect: Lab_A is the reference; other labs get gene-wise log-normal factors.
+  batch_factor <- matrix(1, nrow = n_genes, ncol = length(BATCH_LEVELS))
+  if (batch_effect_sd > 0) {
+    for (b in 2:length(BATCH_LEVELS)) batch_factor[, b] <- exp(rnorm(n_genes, 0, batch_effect_sd))
+  }
+  mu <- mu * batch_factor[, as.integer(pheno_data$Batch), drop = FALSE]
 
+  raw_counts <- matrix(rnbinom(length(mu), mu = mu, size = 1.2), nrow = n_genes)
+  stopifnot(max(raw_counts) < .Machine$integer.max)
   storage.mode(raw_counts) <- "integer"
+  rownames(raw_counts) <- paste0("ENSG", sprintf("%06d", seq_len(n_genes)))
+  colnames(raw_counts) <- pheno_data$Sample_ID
 
   list(
     counts = raw_counts,
@@ -188,12 +243,19 @@ simulate_multiomics_cohort <- function(n_samples = 500, n_genes = 20000, seed = 
 # --------------------------------------------------------------------------------------------------
 # 03. BATCH CORRECTION + QC DIAGNOSTICS
 # --------------------------------------------------------------------------------------------------
+#' Largest R^2 between batch label and any of the first `n_pcs` principal components
+batch_pc_r2 <- function(counts, batch, n_pcs = 5) {
+  n_pcs <- min(n_pcs, ncol(counts) - 1)
+  pca <- prcomp(t(log1p(counts)), center = TRUE, scale. = FALSE, rank. = n_pcs)
+  r2 <- apply(pca$x, 2, function(pc) summary(lm(pc ~ batch))$r.squared)
+  max(r2)
+}
+
 #' Run ComBat-seq batch correction and report a PCA-based sanity check
 run_batch_correction <- function(raw_counts, pheno_data, output_dir) {
   flog.info("Running ComBat-seq batch correction across %d batches.", nlevels(pheno_data$Batch))
 
-  pre_pca <- prcomp(t(log1p(raw_counts)), scale. = FALSE)
-  pre_batch_r2 <- summary(lm(pre_pca$x[, 1] ~ pheno_data$Batch))$r.squared
+  pre_batch_r2 <- batch_pc_r2(raw_counts, pheno_data$Batch)
 
   adjusted_counts <- ComBat_seq(
     counts = as.matrix(raw_counts),
@@ -201,19 +263,18 @@ run_batch_correction <- function(raw_counts, pheno_data, output_dir) {
     group = pheno_data$Treatment_Group
   )
 
-  post_pca <- prcomp(t(log1p(adjusted_counts)), scale. = FALSE)
-  post_batch_r2 <- summary(lm(post_pca$x[, 1] ~ pheno_data$Batch))$r.squared
+  post_batch_r2 <- batch_pc_r2(adjusted_counts, pheno_data$Batch)
 
-  flog.info("Batch effect on PC1 -- before: R2=%.3f | after: R2=%.3f", pre_batch_r2, post_batch_r2)
+  flog.info("Max batch R2 over PC1-5 -- before: %.3f | after: %.3f", pre_batch_r2, post_batch_r2)
 
   qc_report <- data.frame(
     stage = c("pre_correction", "post_correction"),
-    pc1_batch_r2 = c(pre_batch_r2, post_batch_r2)
+    max_pc1to5_batch_r2 = c(pre_batch_r2, post_batch_r2)
   )
   write_csv(qc_report, file.path(output_dir, "batch_correction_qc.csv"))
 
   if (post_batch_r2 >= pre_batch_r2) {
-    flog.warn("ComBat-seq did not reduce PC1 batch association -- inspect batch design further.")
+    flog.warn("ComBat-seq did not reduce PC-batch association -- inspect batch design further.")
   }
 
   adjusted_counts
@@ -224,7 +285,7 @@ run_batch_correction <- function(raw_counts, pheno_data, output_dir) {
 # 04. DIFFERENTIAL EXPRESSION (DESeq2, LRT, apeglm SHRINKAGE)
 # --------------------------------------------------------------------------------------------------
 #' Fit DESeq2 with a likelihood ratio test across the full dose-response design
-run_deseq2_lrt <- function(adjusted_counts, pheno_data, num_cores, alpha = 0.05) {
+run_deseq2_lrt <- function(adjusted_counts, pheno_data, num_cores, output_dir = NULL, alpha = 0.05) {
   flog.info("Fitting DESeq2 LRT model (full: ~Treatment_Group, reduced: ~1).")
 
   dds <- DESeqDataSetFromMatrix(
@@ -233,6 +294,7 @@ run_deseq2_lrt <- function(adjusted_counts, pheno_data, num_cores, alpha = 0.05)
     design = ~ Treatment_Group
   )
   dds <- dds[rowSums(counts(dds) >= 10) >= 0.2 * ncol(dds), ]  # low-count gene filtering
+  flog.info("%d genes retained after low-count filtering.", nrow(dds))
   dds <- DESeq(dds, test = "LRT", reduced = ~1, parallel = (num_cores > 1))
 
   res <- results(dds, alpha = alpha, independentFiltering = TRUE)
@@ -248,7 +310,15 @@ run_deseq2_lrt <- function(adjusted_counts, pheno_data, num_cores, alpha = 0.05)
   n_sig <- sum(res$padj < alpha, na.rm = TRUE)
   flog.info("DESeq2 LRT complete: %d genes significant at padj < %.2f", n_sig, alpha)
 
-  vsd <- vst(dds, blind = FALSE)
+  # vst() subsamples 1000 genes; fall back to the full transform for small gene sets.
+  vsd <- if (nrow(dds) >= 1000) vst(dds, blind = FALSE) else varianceStabilizingTransformation(dds, blind = FALSE)
+
+  if (!is.null(output_dir)) {
+    de_table <- as.data.frame(res)
+    de_table$shrunk_log2FC_high_vs_vehicle <- shrunk$log2FoldChange[match(rownames(de_table), rownames(shrunk))]
+    de_table <- tibble::rownames_to_column(de_table, "gene_id")
+    write_csv(de_table[order(de_table$padj), ], file.path(output_dir, "deseq2_lrt_results.csv"))
+  }
 
   list(dds = dds, results = res, shrunk_lfc = shrunk, vst_matrix = assay(vsd))
 }
@@ -259,6 +329,7 @@ run_deseq2_lrt <- function(adjusted_counts, pheno_data, num_cores, alpha = 0.05)
 # --------------------------------------------------------------------------------------------------
 #' Build a signed weighted gene co-expression network and identify trait-correlated modules
 run_wgcna_analysis <- function(vst_matrix, pheno_data, num_cores, n_top_genes = 5000) {
+  n_top_genes <- min(n_top_genes, nrow(vst_matrix))
   flog.info("Selecting top %d variable genes for WGCNA network construction.", n_top_genes)
 
   gene_vars <- matrixStats::rowVars(vst_matrix)
@@ -280,17 +351,20 @@ run_wgcna_analysis <- function(vst_matrix, pheno_data, num_cores, n_top_genes = 
     optimal_power <- 6
   }
   flog.info("Soft-thresholding power selected: %d (scale-free fit R^2 = %.2f)",
-            optimal_power, sft$fitIndices$SFT.R.sq[sft$fitIndices$Power == optimal_power])
+            as.integer(optimal_power),
+            sft$fitIndices$SFT.R.sq[sft$fitIndices$Power == optimal_power])
 
   net <- blockwiseModules(
     datExpr, power = optimal_power,
-    TOMType = "signed", minModuleSize = 50,
+    networkType = "signed", TOMType = "signed", minModuleSize = 50,
+    maxBlockSize = ncol(datExpr),
     reassignThreshold = 0, mergeCutHeight = 0.25,
     numericLabels = TRUE, pamRespectsDendro = FALSE,
     saveTOMs = FALSE, verbose = 0, nThreads = num_cores
   )
 
   module_eigengenes <- net$MEs
+  rownames(module_eigengenes) <- rownames(datExpr)
   module_labels <- net$colors
 
   # Module-trait correlation against continuous toxicity score
@@ -298,11 +372,14 @@ run_wgcna_analysis <- function(vst_matrix, pheno_data, num_cores, n_top_genes = 
   module_trait_cor <- cor(module_eigengenes, toxicity_aligned, use = "pairwise.complete.obs")
   module_trait_p <- corPvalueStudent(module_trait_cor, nrow(datExpr))
 
-  # Hub gene identification via intramodular connectivity
-  connectivity <- intramodularConnectivity(adjacency(datExpr, power = optimal_power), module_labels)
-  hub_genes <- rownames(connectivity)[order(-connectivity$kWithin)][1:20]
+  # Hub gene identification via intramodular connectivity (module 0 = unassigned, excluded)
+  connectivity <- intramodularConnectivity(
+    adjacency(datExpr, power = optimal_power, type = "signed"), module_labels
+  )
+  assigned <- connectivity[module_labels != 0, , drop = FALSE]
+  hub_genes <- head(rownames(assigned)[order(-assigned$kWithin)], 20)
 
-  flog.info("WGCNA complete: %d modules detected; top module-trait |r| = %.2f",
+  flog.info("WGCNA complete: %d modules (incl. unassigned ME0) detected; top module-trait |r| = %.2f",
             ncol(module_eigengenes), max(abs(module_trait_cor)))
 
   list(
@@ -320,24 +397,41 @@ run_wgcna_analysis <- function(vst_matrix, pheno_data, num_cores, n_top_genes = 
 # --------------------------------------------------------------------------------------------------
 # 06. PATHWAY-LEVEL ENRICHMENT (GSVA) -- used as an engineered feature block, not decorative import
 # --------------------------------------------------------------------------------------------------
-#' Compute single-sample GSVA enrichment scores for a small curated hepatotoxicity gene-set panel
-run_gsva_enrichment <- function(vst_matrix, num_cores) {
+#' Build an illustrative hepatotoxicity gene-set panel for the simulated data.
+#'
+#' Each "mechanistic" set is up to ~70% true members of the corresponding injected module plus ~30%
+#' random decoys (mimicking an imperfect curated annotation). Only gene IDs are used -- no sample
+#' labels -- so this does not leak the outcome. In production replace with
+#' `msigdbr::msigdbr(species = "Homo sapiens", category = "H")`.
+#' @param module_genes list(oxidative_stress, apoptosis, necrosis) of gene IDs (optional)
+build_illustrative_gene_sets <- function(all_genes, module_genes = NULL, seed = 1) {
+  set.seed(seed)
+  make_set <- function(true_genes, size) {
+    true_genes <- intersect(true_genes, all_genes)
+    true_genes <- if (length(true_genes) > 0)
+      sample(true_genes, min(floor(0.7 * size), length(true_genes))) else character(0)
+    decoys <- sample(setdiff(all_genes, true_genes), size - length(true_genes))
+    c(true_genes, decoys)
+  }
+  gm <- module_genes
+  size <- function(n) min(n, length(all_genes))
+  list(
+    HALLMARK_OXIDATIVE_STRESS_LIKE = make_set(gm$oxidative_stress, size(150)),
+    HALLMARK_APOPTOSIS_LIKE        = make_set(gm$apoptosis, size(150)),
+    HALLMARK_NECROSIS_LIKE         = make_set(gm$necrosis, size(120)),
+    HALLMARK_XENOBIOTIC_METAB_LIKE = make_set(NULL, size(100))
+  )
+}
+
+#' Compute single-sample GSVA enrichment scores for a hepatotoxicity gene-set panel
+run_gsva_enrichment <- function(vst_matrix, num_cores, gene_sets = NULL) {
   flog.info("Computing GSVA single-sample enrichment scores for curated hepatotoxicity gene sets.")
 
-  # In a real deployment these would be pulled from MSigDB Hallmark / Reactome via msigdbr;
-  # a small illustrative panel is defined here from the row-index space of the simulated data
-  # so the function is runnable standalone. Swap in `msigdbr::msigdbr(category = "H")` in production.
-  all_genes <- rownames(vst_matrix)
-  set.seed(1)
-  gene_sets <- list(
-    HALLMARK_OXIDATIVE_STRESS_LIKE = sample(all_genes, 150),
-    HALLMARK_APOPTOSIS_LIKE        = sample(all_genes, 150),
-    HALLMARK_NECROSIS_LIKE         = sample(all_genes, 120),
-    HALLMARK_XENOBIOTIC_METAB_LIKE = sample(all_genes, 100)
-  )
+  if (is.null(gene_sets)) gene_sets <- build_illustrative_gene_sets(rownames(vst_matrix))
+  gene_sets <- lapply(gene_sets, intersect, rownames(vst_matrix))
 
   gsva_param <- GSVA::gsvaParam(as.matrix(vst_matrix), gene_sets, kcdf = "Gaussian")
-  gsva_scores <- GSVA::gsva(gsva_param, BPPARAM = BiocParallel::MulticoreParam(num_cores))
+  gsva_scores <- GSVA::gsva(gsva_param, BPPARAM = make_bpparam(num_cores), verbose = FALSE)
 
   flog.info("GSVA complete: %d pathway-level features generated per sample.", nrow(gsva_scores))
   t(gsva_scores)
@@ -347,29 +441,33 @@ run_gsva_enrichment <- function(vst_matrix, num_cores) {
 # --------------------------------------------------------------------------------------------------
 # 07. REPRESENTATION LEARNING -- DEEP AUTOENCODER (ACTUALLY TRAINED)
 # --------------------------------------------------------------------------------------------------
+#' Min-max scale each gene (column) to [0, 1]; constant genes become 0.
+minmax_scale_columns <- function(x) {
+  mins <- apply(x, 2, min)
+  rngs <- apply(x, 2, max) - mins
+  rngs[rngs == 0] <- 1
+  sweep(sweep(x, 2, mins, "-"), 2, rngs, "/")
+}
+
 #' Train a deep autoencoder and return the encoder-side latent representation
 #'
 #' Unlike a placeholder implementation, this function performs a real fit() call and a real
 #' predict() call. If TensorFlow/Keras are not installed, it fails explicitly rather than
-#' fabricating a latent space with random noise.
-build_and_train_autoencoder <- function(vst_matrix, latent_dim = 32, output_dir,
+#' fabricating a latent space with random noise. The autoencoder is unsupervised (it never sees
+#' the toxicity label) and is fit on all samples.
+build_and_train_autoencoder <- function(vst_matrix, latent_dim = 32, output_dir, seed = 2026,
                                          epochs = 100, batch_size = 32, val_split = 0.2) {
+  n_genes <- nrow(vst_matrix)
   flog.info("Building autoencoder: input_dim=%d -> 512 -> 128 -> %d (bottleneck)",
-            nrow(vst_matrix), latent_dim)
+            n_genes, latent_dim)
 
   if (!reticulate::py_module_available("tensorflow")) {
-    stop("TensorFlow backend not available in this environment. Install tensorflow/keras ",
-         "(e.g. `keras::install_keras()`) before running the representation-learning stage.")
+    stop("TensorFlow backend not available in this environment. Install it first, e.g. ",
+         "`keras::install_keras()` (keras 2.x) or `keras3::install_keras()` (keras3), then re-run.")
   }
+  tensorflow::set_random_seed(seed)
 
-  n_genes <- nrow(vst_matrix)
-
-  normalize_rowwise <- function(x) {
-    rng <- max(x) - min(x)
-    if (rng == 0) return(rep(0, length(x)))
-    (x - min(x)) / rng
-  }
-  x_train <- t(apply(vst_matrix, 1, normalize_rowwise))  # samples x genes, scaled 0-1
+  x_train <- minmax_scale_columns(t(vst_matrix))  # samples x genes, each gene scaled to 0-1
 
   input_layer <- layer_input(shape = c(n_genes))
   encoded <- input_layer %>%
@@ -406,8 +504,9 @@ build_and_train_autoencoder <- function(vst_matrix, latent_dim = 32, output_dir,
     verbose = 0
   )
 
-  final_val_loss <- tail(history$metrics$val_loss, 1)
-  flog.info("Autoencoder training complete. Final val_loss = %.5f", final_val_loss)
+  final_val_loss <- min(unlist(history$metrics$val_loss))  # best epoch (weights were restored)
+  flog.info("Autoencoder training complete after %d epochs. Best val_loss = %.5f",
+            length(history$metrics$val_loss), final_val_loss)
 
   encoder_model <- keras_model(
     inputs = autoencoder$input,
@@ -419,6 +518,7 @@ build_and_train_autoencoder <- function(vst_matrix, latent_dim = 32, output_dir,
 
   list(
     latent_features = latent_features,
+    encoder = encoder_model,
     history = history,
     final_val_loss = final_val_loss,
     checkpoint_path = checkpoint_path
@@ -427,42 +527,59 @@ build_and_train_autoencoder <- function(vst_matrix, latent_dim = 32, output_dir,
 
 
 # --------------------------------------------------------------------------------------------------
-# 08. PREDICTIVE MODEL -- NESTED CV + BAYESIAN HYPERPARAMETER OPTIMIZATION (XGBOOST)
+# 08. PREDICTIVE MODEL -- HOLDOUT + INNER-CV BAYESIAN HYPERPARAMETER OPTIMIZATION (XGBOOST)
 # --------------------------------------------------------------------------------------------------
+#' Coefficient of determination (1 - SSE/SST); unlike cor()^2 it penalizes biased predictions.
+r2_score <- function(pred, actual) {
+  1 - sum((actual - pred)^2) / sum((actual - mean(actual))^2)
+}
+
 #' Train an XGBoost regressor with an outer holdout split and an inner Bayesian-optimized
-#' hyperparameter search (rather than a single fixed hyperparameter set).
-train_xgboost_model <- function(ai_dataset, bo_iterations = 15, seed = 2026) {
-  flog.info("Preparing train/test split and nested CV scoring function for XGBoost.")
+#' hyperparameter search. Hyperparameters AND the number of boosting rounds are chosen by
+#' 5-fold CV on the training split only; the test split is touched exactly once, for scoring.
+train_xgboost_model <- function(ai_dataset, bo_iterations = 15, seed = 2026, num_cores = 1) {
+  flog.info("Preparing train/test split and inner CV scoring function for XGBoost.")
 
   set.seed(seed)
   train_idx <- createDataPartition(ai_dataset$Toxicity, p = 0.8, list = FALSE)
   train_data <- ai_dataset[train_idx, ]
   test_data  <- ai_dataset[-train_idx, ]
 
-  x_train <- as.matrix(train_data %>% select(-Toxicity))
+  x_train <- as.matrix(select(train_data, -Toxicity))
   y_train <- train_data$Toxicity
-  x_test  <- as.matrix(test_data %>% select(-Toxicity))
+  x_test  <- as.matrix(select(test_data, -Toxicity))
   y_test  <- test_data$Toxicity
 
   dtrain <- xgb.DMatrix(data = x_train, label = y_train)
   dtest  <- xgb.DMatrix(data = x_test, label = y_test)
 
-  # Inner scoring function: 5-fold CV RMSE for a given hyperparameter set
-  cv_score <- function(eta, max_depth, subsample, colsample_bytree, min_child_weight) {
-    params <- list(
+  cv_folds <- createFolds(y_train, k = 5)  # fixed folds -> comparable scores across BO steps
+
+  make_params <- function(eta, max_depth, subsample, colsample_bytree, min_child_weight) {
+    list(
       objective = "reg:squarederror",
       eta = eta,
       max_depth = as.integer(round(max_depth)),
       subsample = subsample,
       colsample_bytree = colsample_bytree,
-      min_child_weight = min_child_weight
+      min_child_weight = min_child_weight,
+      nthread = num_cores
     )
+  }
+
+  run_cv <- function(params) {
     cv <- xgb.cv(
-      params = params, data = dtrain, nrounds = 500, nfold = 5,
+      params = params, data = dtrain, nrounds = 1000, folds = cv_folds,
       early_stopping_rounds = 20, verbose = 0, metrics = "rmse"
     )
-    best_rmse <- min(cv$evaluation_log$test_rmse_mean)
-    list(Score = -best_rmse, nrounds = cv$best_iteration)  # ParBayesianOptimization maximizes
+    log <- as.data.frame(cv$evaluation_log)
+    best <- which.min(log$test_rmse_mean)
+    list(rmse = log$test_rmse_mean[best], nrounds = best)
+  }
+
+  cv_score <- function(eta, max_depth, subsample, colsample_bytree, min_child_weight) {
+    cv <- run_cv(make_params(eta, max_depth, subsample, colsample_bytree, min_child_weight))
+    list(Score = -cv$rmse)  # ParBayesianOptimization maximizes
   }
 
   flog.info("Running Bayesian hyperparameter optimization (%d iterations).", bo_iterations)
@@ -474,6 +591,7 @@ train_xgboost_model <- function(ai_dataset, bo_iterations = 15, seed = 2026) {
     min_child_weight = c(1, 10)
   )
 
+  set.seed(seed)
   opt_result <- bayesOpt(
     FUN = cv_score, bounds = bounds,
     initPoints = max(6, length(bounds) + 2),
@@ -484,34 +602,26 @@ train_xgboost_model <- function(ai_dataset, bo_iterations = 15, seed = 2026) {
   flog.info("Best hyperparameters found: %s",
             paste(sprintf("%s=%.4f", names(best_params), unlist(best_params)), collapse = ", "))
 
-  final_params <- c(
-    list(objective = "reg:squarederror"),
-    eta = best_params$eta,
-    max_depth = as.integer(round(best_params$max_depth)),
-    subsample = best_params$subsample,
-    colsample_bytree = best_params$colsample_bytree,
-    min_child_weight = best_params$min_child_weight
-  )
+  final_params <- do.call(make_params, as.list(best_params[names(bounds)]))
+  final_cv <- run_cv(final_params)
+  flog.info("Inner-CV RMSE at best params: %.2f (%d boosting rounds).", final_cv$rmse, final_cv$nrounds)
 
-  xgb_model <- xgb.train(
-    params = final_params, data = dtrain, nrounds = 1000,
-    watchlist = list(train = dtrain, test = dtest),
-    early_stopping_rounds = 20, print_every_n = 100, verbose = 0
-  )
+  xgb_model <- xgb.train(params = final_params, data = dtrain, nrounds = final_cv$nrounds, verbose = 0)
 
   preds <- predict(xgb_model, dtest)
   rmse <- sqrt(mean((preds - y_test)^2))
-  r_squared <- cor(preds, y_test)^2
+  r_squared <- r2_score(preds, y_test)
 
   flog.info("Final XGBoost model -- Test RMSE: %.2f | Test R^2: %.3f", rmse, r_squared)
 
   list(
     model = xgb_model,
     best_params = final_params,
+    cv_rmse = final_cv$rmse,
     optimization_trace = opt_result,
     test_predictions = preds,
     test_actual = y_test,
-    metrics = list(rmse = rmse, r_squared = r_squared),
+    metrics = list(rmse = rmse, r_squared = r_squared, cv_rmse = final_cv$rmse),
     train_data = train_data,
     test_data = test_data
   )
@@ -526,7 +636,7 @@ train_xgboost_model <- function(ai_dataset, bo_iterations = 15, seed = 2026) {
 compute_shap_values <- function(xgb_model, train_data) {
   flog.info("Computing SHAP values for model interpretation.")
 
-  x_train <- as.matrix(train_data %>% select(-Toxicity))
+  x_train <- as.matrix(select(train_data, -Toxicity))
   shap_values <- shap.values(xgb_model = xgb_model, X_train = x_train)
   shap_long <- shap.prep(shap_contrib = shap_values$shap_score, X_train = x_train)
 
@@ -534,8 +644,8 @@ compute_shap_values <- function(xgb_model, train_data) {
     sort(decreasing = TRUE) %>%
     head(10)
 
-  flog.info("Top 3 SHAP-ranked features: %s",
-            paste(names(top_features)[1:3], collapse = ", "))
+  flog.info("Top %d SHAP-ranked features: %s", min(3, length(top_features)),
+            paste(head(names(top_features), 3), collapse = ", "))
 
   list(shap_values = shap_values, shap_long = shap_long, top_features = top_features)
 }
@@ -554,7 +664,7 @@ bootstrap_model_diagnostics <- function(preds, actual, n_boot = 2000, seed = 202
   for (b in seq_len(n_boot)) {
     idx <- sample(seq_len(n), n, replace = TRUE)
     rmse_boot[b] <- sqrt(mean((preds[idx] - actual[idx])^2))
-    r2_boot[b] <- suppressWarnings(cor(preds[idx], actual[idx])^2)
+    r2_boot[b] <- r2_score(preds[idx], actual[idx])
   }
 
   residuals <- preds - actual
@@ -573,16 +683,49 @@ bootstrap_model_diagnostics <- function(preds, actual, n_boot = 2000, seed = 202
 # --------------------------------------------------------------------------------------------------
 # 11. PERSISTENCE -- ARTIFACT SERIALIZATION
 # --------------------------------------------------------------------------------------------------
+#' Write human-readable results (metrics, predictions, hub genes, plots) next to the models.
+write_reports <- function(output_dir, xgb_result, shap_result, wgcna_result, diagnostics) {
+  metrics <- data.frame(
+    metric = c("test_rmse", "test_r2", "inner_cv_rmse", "rmse_ci_low", "rmse_ci_high",
+               "r2_ci_low", "r2_ci_high", "residual_mean", "residual_sd", "shapiro_p"),
+    value = c(xgb_result$metrics$rmse, xgb_result$metrics$r_squared, xgb_result$metrics$cv_rmse,
+              diagnostics$rmse_ci[[1]], diagnostics$rmse_ci[[3]],
+              diagnostics$r2_ci[[1]], diagnostics$r2_ci[[3]],
+              diagnostics$residual_mean, diagnostics$residual_sd, diagnostics$residual_normality_p)
+  )
+  write_csv(metrics, file.path(output_dir, "model_metrics.csv"))
+  write_csv(data.frame(actual = xgb_result$test_actual, predicted = xgb_result$test_predictions),
+            file.path(output_dir, "test_predictions.csv"))
+  write_csv(data.frame(rank = seq_along(wgcna_result$hub_genes), gene_id = wgcna_result$hub_genes),
+            file.path(output_dir, "wgcna_hub_genes.csv"))
+  write_csv(tibble::tibble(feature = names(shap_result$top_features),
+                           mean_abs_shap = as.numeric(shap_result$top_features)),
+            file.path(output_dir, "shap_top_features.csv"))
+
+  tryCatch({
+    p <- ggplot(data.frame(actual = xgb_result$test_actual, predicted = xgb_result$test_predictions),
+                aes(actual, predicted)) +
+      geom_point(alpha = 0.6) + geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+      labs(title = "Held-out test set: predicted vs. actual toxicity score",
+           x = "Actual Toxicity_Score", y = "Predicted Toxicity_Score") +
+      theme_minimal()
+    ggsave(file.path(output_dir, "predicted_vs_actual.png"), p, width = 6, height = 5, dpi = 150)
+    ggsave(file.path(output_dir, "shap_summary.png"),
+           SHAPforxgboost::shap.plot.summary(shap_result$shap_long), width = 7, height = 6, dpi = 150)
+  }, error = function(e) flog.warn("Plot generation failed: %s", conditionMessage(e)))
+}
+
 persist_pipeline_artifacts <- function(output_dir, xgb_result, ae_result, wgcna_result, shap_result) {
   dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
 
   xgb.save(xgb_result$model, file.path(output_dir, "xgboost_dili_model.xgb"))
   saveRDS(wgcna_result, file.path(output_dir, "wgcna_result.rds"))
   saveRDS(shap_result, file.path(output_dir, "shap_result.rds"))
-  save_model_tf(keras_model(
-    inputs = layer_input(shape = ncol(ae_result$latent_features)), # lightweight metadata stub
-    outputs = layer_input(shape = ncol(ae_result$latent_features))
-  ), file.path(output_dir, "autoencoder_metadata_stub"))
+  saveRDS(ae_result$latent_features, file.path(output_dir, "autoencoder_latent_features.rds"))
+  tryCatch(
+    ae_result$encoder$save(file.path(output_dir, "autoencoder_encoder.keras")),
+    error = function(e) flog.warn("Could not save the encoder model: %s", conditionMessage(e))
+  )
 
   flog.info("All model artifacts persisted to %s", output_dir)
 }
@@ -594,28 +737,92 @@ persist_pipeline_artifacts <- function(output_dir, xgb_result, ae_result, wgcna_
 run_unit_tests <- function() {
   flog.info("Running unit-test suite for simulation and preprocessing functions.")
 
-  test_that("simulate_multiomics_cohort returns correctly shaped objects", {
-    sim <- simulate_multiomics_cohort(n_samples = 20, n_genes = 500, seed = 1)
-    expect_equal(dim(sim$counts), c(500, 20))
-    expect_equal(nrow(sim$pheno), 20)
-    expect_true(all(sim$pheno$Toxicity_Score >= 0 & sim$pheno$Toxicity_Score <= 100))
-    expect_true(all(sapply(sim$ground_truth_modules, length) > 0))
+  reporter <- testthat::ListReporter$new()
+  testthat::with_reporter(reporter, {
+
+    test_that("simulate_multiomics_cohort returns correctly shaped objects", {
+      sim <- simulate_multiomics_cohort(n_samples = 20, n_genes = 500, seed = 1)
+      expect_equal(dim(sim$counts), c(500, 20))
+      expect_equal(nrow(sim$pheno), 20)
+      expect_identical(rownames(sim$pheno), colnames(sim$counts))
+      expect_true(all(sim$pheno$Toxicity_Score >= 0 & sim$pheno$Toxicity_Score <= 100))
+      expect_true(all(sapply(sim$ground_truth_modules, length) > 0))
+    })
+
+    test_that("ground-truth modules are disjoint and within range", {
+      sim <- simulate_multiomics_cohort(n_samples = 20, n_genes = 2000, seed = 4)
+      all_idx <- unlist(sim$ground_truth_modules)
+      expect_equal(anyDuplicated(all_idx), 0)
+      expect_true(all(all_idx >= 1 & all_idx <= 2000))
+    })
+
+    test_that("simulated counts are non-negative integers", {
+      sim <- simulate_multiomics_cohort(n_samples = 10, n_genes = 200, seed = 2)
+      expect_true(all(sim$counts >= 0))
+      expect_true(is.integer(sim$counts))
+    })
+
+    test_that("simulation is reproducible for a fixed seed", {
+      a <- simulate_multiomics_cohort(n_samples = 10, n_genes = 100, seed = 7)
+      b <- simulate_multiomics_cohort(n_samples = 10, n_genes = 100, seed = 7)
+      expect_identical(a$counts, b$counts)
+    })
+
+    test_that("high-dose samples show elevated toxicity relative to vehicle", {
+      sim <- simulate_multiomics_cohort(n_samples = 200, n_genes = 300, seed = 3)
+      veh_mean <- mean(sim$pheno$Toxicity_Score[sim$pheno$Treatment_Group == "Vehicle"])
+      high_mean <- mean(sim$pheno$Toxicity_Score[sim$pheno$Treatment_Group == "High_Dose"])
+      expect_gt(high_mean, veh_mean)
+    })
+
+    test_that("the simulated batch effect is detectable (and absent when disabled)", {
+      with_b <- simulate_multiomics_cohort(n_samples = 90, n_genes = 1000, seed = 5, batch_effect_sd = 0.8)
+      no_b   <- simulate_multiomics_cohort(n_samples = 90, n_genes = 1000, seed = 5, batch_effect_sd = 0)
+      expect_gt(batch_pc_r2(with_b$counts, with_b$pheno$Batch),
+                batch_pc_r2(no_b$counts, no_b$pheno$Batch))
+    })
+
+    test_that("autoencoder input scaling maps every gene into [0, 1]", {
+      x <- matrix(c(1, 5, 3, 2, 2, 2), nrow = 3)  # second gene is constant
+      scaled <- minmax_scale_columns(x)
+      expect_equal(dim(scaled), dim(x))
+      expect_true(all(scaled >= 0 & scaled <= 1))
+      expect_equal(scaled[, 2], c(0, 0, 0))
+    })
+
+    test_that("r2_score and bootstrap diagnostics behave sensibly", {
+      y <- c(10, 20, 30, 40, 50)
+      expect_equal(r2_score(y, y), 1)
+      expect_lt(r2_score(rep(mean(y), 5), y), 1e-12)
+      d <- bootstrap_model_diagnostics(y + c(1, -1, 1, -1, 0), y, n_boot = 50, seed = 1)
+      expect_lte(d$rmse_ci[[1]], d$rmse_ci[[3]])
+    })
+
+    test_that("illustrative gene sets are enriched for the injected modules", {
+      sim <- simulate_multiomics_cohort(n_samples = 10, n_genes = 2000, seed = 6)
+      module_genes <- lapply(sim$ground_truth_modules, function(idx) rownames(sim$counts)[idx])
+      gs <- build_illustrative_gene_sets(rownames(sim$counts), module_genes)
+      truth <- module_genes$oxidative_stress
+      # far above the chance rate of length(truth) / n_genes
+      expect_gt(mean(gs$HALLMARK_OXIDATIVE_STRESS_LIKE %in% truth),
+                5 * length(truth) / nrow(sim$counts))
+      expect_true(all(unlist(gs) %in% rownames(sim$counts)))
+    })
+
+    test_that("CLI parsing applies defaults and overrides", {
+      o <- parse_cli_args(c("--n_samples", "60", "--n_genes", "3000"))
+      expect_equal(o$n_samples, 60)
+      expect_equal(o$seed, 2026)
+      expect_error(parse_cli_args(c("--n_samples", "5")))
+    })
   })
 
-  test_that("simulated counts are non-negative integers", {
-    sim <- simulate_multiomics_cohort(n_samples = 10, n_genes = 200, seed = 2)
-    expect_true(all(sim$counts >= 0))
-    expect_true(is.integer(sim$counts))
-  })
-
-  test_that("high-dose samples show elevated toxicity relative to vehicle", {
-    sim <- simulate_multiomics_cohort(n_samples = 200, n_genes = 300, seed = 3)
-    veh_mean <- mean(sim$pheno$Toxicity_Score[sim$pheno$Treatment_Group == "Vehicle"])
-    high_mean <- mean(sim$pheno$Toxicity_Score[sim$pheno$Treatment_Group == "High_Dose"])
-    expect_gt(high_mean, veh_mean)
-  })
-
-  flog.info("Unit-test suite passed.")
+  results <- as.data.frame(reporter$get_results())
+  bad <- results[results$failed > 0 | results$error, , drop = FALSE]
+  if (nrow(bad) > 0) {
+    stop("Unit tests failed: ", paste(bad$test, collapse = "; "))
+  }
+  flog.info("Unit-test suite passed (%d test blocks).", nrow(results))
 }
 
 
@@ -636,16 +843,20 @@ run_pipeline <- function(opts) {
   adjusted_counts <- run_batch_correction(sim$counts, sim$pheno, opts$output_dir)
 
   flog.info("=== STAGE 3/7: Differential expression (DESeq2 LRT) ===")
-  de_result <- run_deseq2_lrt(adjusted_counts, sim$pheno, num_cores)
+  de_result <- run_deseq2_lrt(adjusted_counts, sim$pheno, num_cores, opts$output_dir)
 
   flog.info("=== STAGE 4/7: Network biology (WGCNA) ===")
   wgcna_result <- run_wgcna_analysis(de_result$vst_matrix, sim$pheno, num_cores)
 
   flog.info("=== STAGE 5/7: Pathway enrichment (GSVA) ===")
-  gsva_features <- run_gsva_enrichment(de_result$vst_matrix, num_cores)
+  module_genes <- lapply(sim$ground_truth_modules, function(idx) rownames(sim$counts)[idx])
+  gene_sets <- build_illustrative_gene_sets(rownames(de_result$vst_matrix), module_genes,
+                                            seed = opts$seed)
+  gsva_features <- run_gsva_enrichment(de_result$vst_matrix, num_cores, gene_sets)
 
   flog.info("=== STAGE 6/7: Representation learning (autoencoder) ===")
-  ae_result <- build_and_train_autoencoder(de_result$vst_matrix, opts$latent_dim, opts$output_dir)
+  ae_result <- build_and_train_autoencoder(de_result$vst_matrix, opts$latent_dim, opts$output_dir,
+                                           seed = opts$seed)
 
   flog.info("=== STAGE 7/7: Predictive modeling (XGBoost + Bayesian tuning) ===")
   common_samples <- Reduce(intersect, list(
@@ -662,15 +873,17 @@ run_pipeline <- function(opts) {
     gsva_features[common_samples, , drop = FALSE]
   )
 
-  xgb_result <- train_xgboost_model(ai_dataset, opts$bo_iterations, opts$seed)
+  xgb_result <- train_xgboost_model(ai_dataset, opts$bo_iterations, opts$seed, num_cores)
   shap_result <- compute_shap_values(xgb_result$model, xgb_result$train_data)
-  diagnostics <- bootstrap_model_diagnostics(xgb_result$test_predictions, xgb_result$test_actual)
+  diagnostics <- bootstrap_model_diagnostics(xgb_result$test_predictions, xgb_result$test_actual,
+                                             seed = opts$seed)
 
   flog.info("Bootstrap RMSE 95%% CI: [%.2f, %.2f] | R^2 95%% CI: [%.3f, %.3f]",
             diagnostics$rmse_ci[1], diagnostics$rmse_ci[3],
             diagnostics$r2_ci[1], diagnostics$r2_ci[3])
 
   persist_pipeline_artifacts(opts$output_dir, xgb_result, ae_result, wgcna_result, shap_result)
+  write_reports(opts$output_dir, xgb_result, shap_result, wgcna_result, diagnostics)
 
   flog.info("Pipeline execution complete. Artifacts written to %s", opts$output_dir)
 
